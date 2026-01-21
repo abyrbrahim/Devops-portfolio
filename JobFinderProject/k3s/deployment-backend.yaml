@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-deployment
+  namespace: jobfinder
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+        - name: backend
+          image: devopsabeer/jobfinder-backend:latest
+          ports:
+            - containerPort: 5000
+          env:
+            - name: NODE_ENV
+              value: "production"
+            - name: PORT
+              value: "5000"
+            - name: MONGO_URI
+              value: "mongodb://16.16.101.153:27017/jobfinder"
+
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+  namespace: jobfinder
+spec:
+  type: NodePort
+  selector:
+    app: backend
+  ports:
+    - port: 5000
+      targetPort: 5000
+      nodePort: 30500  
+
