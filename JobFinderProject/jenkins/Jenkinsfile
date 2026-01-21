@@ -1,0 +1,218 @@
+pipeline {
+    agent any
+
+    environment {
+        BACKEND_IMAGE = "jobfinder-backend"
+        FRONTEND_IMAGE = "jobfinder-frontend"
+        K8S_MANIFEST_DIR = "k8s"
+        SCANNER_HOME = "/opt/sonar-scanner"
+        ZAP_CONTAINER_NAME = "zap-dast"
+        ZAP_PORT = "8090"
+    }
+
+    stages {
+
+        stage('Prepare & Clone Repository') {
+            steps {
+                cleanWs()
+                sshagent(['ssh_connection']) {
+                    sh '''
+                        echo "Initializing Git LFS..."
+                        git lfs install --force
+                        export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no -i /var/lib/jenkins/.ssh/id_rsa"
+                        export GIT_LFS_SKIP_SMUDGE=0
+                        if [ -d ".git" ]; then
+                            git fetch origin
+                            git reset --hard origin/main
+                        else
+                            git clone --branch main git@gitlab.com:abyrbrahim/jobfinderproject.git .
+                        fi
+                        git lfs pull
+                    '''
+                }
+            }
+        }
+
+        stage('SAST - Gitleaks Scan') {
+            steps {
+                script {
+                    def gitleaksReport = "${env.WORKSPACE}/gitleaks-report.json"
+                    sh """
+                        echo "Running Gitleaks scan..."
+                        gitleaks detect \
+                          --source . \
+                          --config ${env.WORKSPACE}/.gitleaks.toml \
+                          --report-path ${gitleaksReport} \
+                          --exit-code 0
+                        echo "Gitleaks scan finished. Report saved at ${gitleaksReport}"
+                    """
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true
+                    echo "Gitleaks report archived."
+                }
+            }
+        }
+
+        stage('SCA - Trivy Scan Dependencies') {
+            steps {
+                script {
+                    sh '''
+                        mkdir -p trivy-reports
+
+                        echo "Scanning backend dependencies..."
+                        trivy fs ./backend --severity HIGH,CRITICAL --format json --output trivy-reports/backend.json || true
+
+                        echo "Scanning frontend dependencies..."
+                        trivy fs ./frontend --severity HIGH,CRITICAL --format json --output trivy-reports/frontend.json || true
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-reports/*.json', allowEmptyArchive: true
+                    echo "Trivy SCA reports archived."
+                }
+            }
+        }
+
+        stage('Build & Scan Docker Images') {
+            parallel {
+
+                stage('Backend: Build & Trivy Scan') {
+                    steps {
+                        sh '''
+                            echo "Building backend Docker image..."
+                            docker rmi -f $BACKEND_IMAGE || true
+                            docker build -t $BACKEND_IMAGE ./backend
+
+                            echo "Scanning backend Docker image..."
+                            trivy image --severity HIGH,CRITICAL --exit-code 1 $BACKEND_IMAGE || true
+                        '''
+                    }
+                }
+
+                stage('Frontend: Build & Trivy Scan') {
+                    steps {
+                        sh '''
+                            echo "Building frontend Docker image..."
+                            docker rmi -f $FRONTEND_IMAGE || true
+                            docker build -t $FRONTEND_IMAGE ./frontend
+
+                            echo "Scanning frontend Docker image..."
+                            trivy image --severity HIGH,CRITICAL --exit-code 1 $FRONTEND_IMAGE || true
+                        '''
+                    }
+                }
+
+            }
+        }
+
+        stage('SAST - SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('Sonarqube') {
+                    withCredentials([
+                        string(credentialsId: 'Sonarqube', variable: 'SONAR_TOKEN')
+                    ]) {
+                        sh '''
+                            $SCANNER_HOME/bin/sonar-scanner \
+                              -Dsonar.projectKey=abyrbrahim_jobfinderproject_aa70a428-25be-42a8-9b06-3662b7b1d324 \
+                              -Dsonar.projectName=JobFinder \
+                              -Dsonar.sources=. \
+                              -Dsonar.exclusions=**/node_modules/**,**/syntax-highlighter/**,**/public/Doc/**,**/dist/**,**/build/** \
+                              -Dsonar.sourceEncoding=UTF-8 \
+                              -Dsonar.host.url=$SONAR_HOST_URL \
+                              -Dsonar.token=$SONAR_TOKEN
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Save & Import Docker Images into K3s') {
+            steps {
+                sh '''
+                    docker save $BACKEND_IMAGE -o backend.tar
+                    docker save $FRONTEND_IMAGE -o frontend.tar
+                    sudo k3s ctr images import backend.tar
+                    sudo k3s ctr images import frontend.tar
+                '''
+            }
+        }
+
+        stage('Deploy to K3s') {
+            steps {
+                sh '''
+                    kubectl apply -f $K8S_MANIFEST_DIR/
+                    kubectl get pods -n jobfinder
+                    kubectl get svc -n jobfinder
+                '''
+            }
+        }
+
+        stage('DAST - ZAP Scan Frontend') {
+            steps {
+                script {
+                    def reportsDir = "${env.WORKSPACE}/zap-reports"
+                    def timestamp = sh(script: "date +%s", returnStdout: true).trim()
+
+                    sh """
+                        mkdir -p ${reportsDir}
+                        chmod 777 ${reportsDir}
+
+                        if docker ps -a --format '{{.Names}}' | grep -q '^${ZAP_CONTAINER_NAME}\$'; then
+                            docker stop ${ZAP_CONTAINER_NAME} || true
+                            docker rm ${ZAP_CONTAINER_NAME} || true
+                        fi
+
+                        docker run --rm -u zap -v ${reportsDir}:/zap/wrk \\
+                            --name ${ZAP_CONTAINER_NAME} zaproxy/zap-stable zap.sh -cmd \\
+                            -quickurl $FRONTEND_URL \\
+                            -quickout /zap/wrk/zap-report-${timestamp}.html
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            publishHTML([
+                allowMissing: false,
+                alwaysLinkToLastBuild: true,
+                keepAll: true,
+                reportDir: 'zap-reports',
+                reportFiles: 'zap-report-*.html',
+                reportName: 'ZAP DAST Report'
+            ])
+
+            emailext(
+                subject: "$JOB_NAME - Build #$BUILD_NUMBER - ${currentBuild.currentResult}",
+                body: """
+                    <h2>Résultat du Pipeline</h2>
+                    <p><b>Projet :</b> $JOB_NAME</p>
+                    <p><b>Build Number :</b> $BUILD_NUMBER</p>
+                    <p><b>Status :</b> ${currentBuild.currentResult}</p>
+                    <p>
+                      <a href="$BUILD_URL">🔗 Lien vers le build Jenkins</a>
+                    </p>
+                    <p>
+                      <a href="$BUILD_URL/ZAP_20DAST_20Report/">📄 Rapport ZAP DAST</a>
+                    </p>
+                """,
+                mimeType: 'text/html',
+                to: 'abyrbrahim@gmail.com'
+            )
+        }
+
+        success {
+            echo "✅ Pipeline terminé avec succès !"
+        }
+
+        failure {
+            echo "❌ Pipeline échoué. Vérifie la console Jenkins."
+        }
+    }
+}
